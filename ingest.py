@@ -40,6 +40,7 @@ USAGE:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sqlite3
@@ -96,6 +97,15 @@ CREATE TABLE IF NOT EXISTS documents (
     file_size           INTEGER,
     mtime               REAL,
     raw_text            TEXT,
+    content_hash         TEXT,               -- sha256 of raw_text, used to detect
+                                              -- the exact same resume content reused
+                                              -- across multiple proposal folders
+    canonical_document_id INTEGER REFERENCES documents(id),
+                                              -- set when this document's content is an
+                                              -- exact duplicate of an earlier document for
+                                              -- the same person -- NULL means this IS the
+                                              -- canonical copy that actually owns the
+                                              -- extracted resume_facts
     created_at          TEXT DEFAULT (datetime('now')),
     updated_at          TEXT DEFAULT (datetime('now'))
 );
@@ -694,6 +704,15 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         cur.execute("ALTER TABLE proposals ADD COLUMN rfp_metadata_manually_edited INTEGER DEFAULT 0")
         conn.commit()
 
+    cur.execute("PRAGMA table_info(documents)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if "content_hash" not in existing_cols:
+        cur.execute("ALTER TABLE documents ADD COLUMN content_hash TEXT")
+        conn.commit()
+    if "canonical_document_id" not in existing_cols:
+        cur.execute("ALTER TABLE documents ADD COLUMN canonical_document_id INTEGER REFERENCES documents(id)")
+        conn.commit()
+
 
 def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = False) -> None:
     manifest = {}
@@ -732,6 +751,28 @@ def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = 
         person_id = get_or_create(cur, "people", "full_name", rec.person_name) if rec.person_name else None
         text = extract_text(rec.path)
         sharepoint_url = manifest.get(rel_path)
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest() if text.strip() else None
+
+        # Duplicate detection: if this is a resume and its content is byte-
+        # identical to another resume already on file for the SAME person
+        # (very common -- the same resume file gets copied as-is into many
+        # proposal folders), don't extract a second full set of facts.
+        # Instead, point this document at the canonical one that already
+        # owns the facts, so corrections made in one place apply everywhere
+        # this exact resume was reused, and the person's page doesn't show
+        # the same content over and over.
+        canonical_document_id = None
+        if rec.doc_type in ("resume_historical", "resume_generated") and person_id and content_hash:
+            cur.execute(
+                """SELECT id FROM documents
+                   WHERE person_id = ? AND content_hash = ? AND canonical_document_id IS NULL
+                   AND local_cache_path != ?
+                   ORDER BY id LIMIT 1""",
+                (person_id, content_hash, abs_path),
+            )
+            canonical_row = cur.fetchone()
+            if canonical_row:
+                canonical_document_id = canonical_row[0]
 
         if existing:
             doc_id = existing[0]
@@ -739,10 +780,12 @@ def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = 
                 """UPDATE documents
                    SET proposal_id=?, person_id=?, doc_type=?, sharepoint_url=?,
                        cache_synced_at=datetime('now'), file_ext=?, file_size=?,
-                       mtime=?, raw_text=?, updated_at=datetime('now')
+                       mtime=?, raw_text=?, content_hash=?, canonical_document_id=?,
+                       updated_at=datetime('now')
                    WHERE id=?""",
                 (proposal_id, person_id, rec.doc_type, sharepoint_url,
-                 rec.path.suffix.lower(), stat.st_size, stat.st_mtime, text, doc_id),
+                 rec.path.suffix.lower(), stat.st_size, stat.st_mtime, text,
+                 content_hash, canonical_document_id, doc_id),
             )
             cur.execute(
                 "DELETE FROM resume_facts WHERE source_document_id = ? AND manually_edited = 0",
@@ -753,15 +796,17 @@ def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = 
             cur.execute(
                 """INSERT INTO documents
                    (proposal_id, person_id, doc_type, source_system, sharepoint_url,
-                    local_cache_path, cache_synced_at, file_ext, file_size, mtime, raw_text)
-                   VALUES (?, ?, ?, 'sharepoint', ?, ?, datetime('now'), ?, ?, ?, ?)""",
+                    local_cache_path, cache_synced_at, file_ext, file_size, mtime, raw_text,
+                    content_hash, canonical_document_id)
+                   VALUES (?, ?, ?, 'sharepoint', ?, ?, datetime('now'), ?, ?, ?, ?, ?, ?)""",
                 (proposal_id, person_id, rec.doc_type, sharepoint_url, abs_path,
-                 rec.path.suffix.lower(), stat.st_size, stat.st_mtime, text),
+                 rec.path.suffix.lower(), stat.st_size, stat.st_mtime, text,
+                 content_hash, canonical_document_id),
             )
             doc_id = cur.lastrowid
             inserted += 1
 
-        if rec.doc_type in ("resume_historical", "resume_generated") and person_id:
+        if rec.doc_type in ("resume_historical", "resume_generated") and person_id and canonical_document_id is None:
             for fact in extract_facts(text):
                 cur.execute(
                     """INSERT INTO resume_facts

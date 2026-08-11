@@ -255,15 +255,30 @@ def person_detail(person_id):
     html = f'<h1>{person["full_name"]}</h1><h2>Resumes on file</h2>'
 
     for d in docs:
+        html += f'<h3>{d["proposal_name"]} &mdash; {d["doc_type"]}</h3>'
+        html += f'<p class="snippet">File: {Path(d["local_cache_path"]).name}</p>'
+
+        if d["canonical_document_id"]:
+            canonical = db.execute(
+                "SELECT d.id, d.proposal_id, p.name as proposal_name FROM documents d JOIN proposals p ON d.proposal_id = p.id WHERE d.id = ?",
+                (d["canonical_document_id"],),
+            ).fetchone()
+            if canonical:
+                html += (
+                    f'<p class="snippet">Identical to the resume already on file for '
+                    f'<a class="name" href="/proposal/{canonical["proposal_id"]}">{canonical["proposal_name"]}</a> -- '
+                    f'facts are tracked once under that copy to avoid duplication. '
+                    f'<a class="name" href="#doc-{d["canonical_document_id"]}">Jump to it below</a> if it appears further down.</p><br>'
+                )
+            continue
+
         facts = db.execute(
             "SELECT * FROM resume_facts WHERE source_document_id = ? ORDER BY fact_type",
             (d["id"],),
         ).fetchall()
         raw_text = d["raw_text"] or "(no text extracted)"
 
-        html += f'<h3>{d["proposal_name"]} &mdash; {d["doc_type"]}</h3>'
-        html += f'<p class="snippet">File: {Path(d["local_cache_path"]).name}</p>'
-
+        html += f'<a id="doc-{d["id"]}"></a>'
         html += '<details><summary>Raw extracted text</summary>'
         html += f'<pre style="white-space: pre-wrap; background:#f7f7f7; padding:10px; border-radius:4px; max-height:400px; overflow:auto;">{_escape(raw_text)}</pre>'
         html += '</details>'
