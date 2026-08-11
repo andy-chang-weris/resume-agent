@@ -288,6 +288,8 @@ def people():
     return render(html)
 
 
+from ingest import normalize_header
+
 FACT_TYPES = ["summary", "education", "certification", "employment", "skills", "years_of_experience", "other"]
 
 
@@ -462,6 +464,103 @@ def people_search():
     return render(html)
 
 
+SECTION_LABEL_TITLES = {
+    "summary": "Summary", "education": "Education", "certification": "Certifications",
+    "employment": "Relevant Experience", "skills": "Skills", "years_of_experience": "Years of Experience",
+    "other": "Other",
+}
+
+
+@app.route("/export/<int:person_id>/<int:proposal_id>/<lcat_name>")
+def export_facts(person_id, proposal_id, lcat_name):
+    db = get_db()
+    person = db.execute("SELECT * FROM people WHERE id = ?", (person_id,)).fetchone()
+    proposal = db.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+    if not person or not proposal:
+        return render("<p>Person or proposal not found.</p>")
+
+    req = {}
+    if proposal["requirements"]:
+        req = json.loads(proposal["requirements"]).get("labor_categories", {}).get(lcat_name, {})
+
+    facts_rows = db.execute("""
+        SELECT rf.fact_type, rf.fact_text FROM resume_facts rf
+        JOIN documents d ON rf.source_document_id = d.id
+        WHERE d.person_id = ? ORDER BY rf.fact_type, rf.id
+    """, (person_id,)).fetchall()
+
+    buckets: dict[str, list[str]] = {}
+    for row in facts_rows:
+        buckets.setdefault(row["fact_type"], []).append(row["fact_text"])
+
+    required_sections = req.get("required_sections") or []
+    used_types = set()
+    ordered_sections = []  # (label, [fact_texts])
+
+    if required_sections:
+        for label in required_sections:
+            fact_type = normalize_header(label)
+            facts = buckets.get(fact_type, []) if fact_type else []
+            if fact_type:
+                used_types.add(fact_type)
+            ordered_sections.append((label, facts))
+        leftover = [(ft, texts) for ft, texts in buckets.items() if ft not in used_types and texts]
+        extra_sections = [(SECTION_LABEL_TITLES.get(ft, ft.title()), texts) for ft, texts in leftover]
+    else:
+        ordered_sections = [(SECTION_LABEL_TITLES.get(ft, ft.title()), texts) for ft, texts in buckets.items()]
+        extra_sections = []
+
+    lines = [person["full_name"]]
+    lines.append(f'{proposal["name"]} -- {lcat_name}')
+    if req.get("page_limit"):
+        lines.append(f'(Target: {req["page_limit"]} page limit)')
+    lines.append("")
+    for label, texts in ordered_sections:
+        lines.append(label.upper())
+        if texts:
+            for t in texts:
+                lines.append(f"- {t}")
+        else:
+            lines.append("- [no extracted facts matched this section -- add manually]")
+        lines.append("")
+    if extra_sections:
+        lines.append("ADDITIONAL EXTRACTED FACTS (not in a required section above)")
+        for label, texts in extra_sections:
+            lines.append(f"[{label}]")
+            for t in texts:
+                lines.append(f"- {t}")
+        lines.append("")
+
+    export_text = "\n".join(lines)
+
+    all_text_lower = " ".join(t for texts in buckets.values() for t in texts).lower()
+    cert_status = [(c, c.lower() in all_text_lower) for c in (req.get("required_certifications") or [])]
+    topic_status = [(t, t.lower() in all_text_lower) for t in (req.get("priority_topics") or [])]
+
+    html = f'<h1>Export: {person["full_name"]}</h1>'
+    html += f'<p class="snippet">{proposal["name"]} &mdash; {lcat_name}</p>'
+
+    if cert_status or topic_status:
+        html += '<h2>Coverage check</h2><p class="snippet">Based on keyword presence in this person\'s extracted facts -- not a judgment of fit, just a quick sanity check.</p>'
+        if cert_status:
+            html += "<p><b>Required certifications:</b> " + ", ".join(
+                f'{c} {"&#10003;" if ok else "&#10007;"}' for c, ok in cert_status
+            ) + "</p>"
+        if topic_status:
+            html += "<p><b>Priority topics:</b> " + ", ".join(
+                f'{t} {"&#10003;" if ok else "&#10007;"}' for t, ok in topic_status
+            ) + "</p>"
+
+    html += '<h2>Copy-ready content</h2>'
+    html += f'<textarea readonly rows="24" style="width:100%; font-family:monospace; font-size:0.85em;" id="exportbox">{_escape(export_text)}</textarea><br>'
+    html += (
+        '<button onclick="navigator.clipboard.writeText(document.getElementById(\'exportbox\').value); '
+        'this.innerText=\'Copied!\'; setTimeout(()=>this.innerText=\'Copy to clipboard\', 1500);">Copy to clipboard</button>'
+    )
+
+    return render(html)
+
+
 @app.route("/match/<int:proposal_id>/<lcat>")
 def match(proposal_id, lcat):
     db = get_db()
@@ -502,11 +601,12 @@ def match(proposal_id, lcat):
 
     scored.sort(key=lambda x: len(x[1]), reverse=True)
 
-    html += "<table><tr><th>Person</th><th>Score</th><th>Matched keywords</th></tr>"
+    html += "<table><tr><th>Person</th><th>Score</th><th>Matched keywords</th><th></th></tr>"
     for person, matched_kw in scored:
         html += f'<tr><td><a class="name" href="/person/{person["id"]}">{person["full_name"]}</a></td>'
         html += f'<td class="score">{len(matched_kw)}/{len(keywords)}</td>'
-        html += f'<td>{", ".join(matched_kw)}</td></tr>'
+        html += f'<td>{", ".join(matched_kw)}</td>'
+        html += f'<td><a class="name" href="/export/{person["id"]}/{proposal_id}/{quote(lcat)}">Export facts &rarr;</a></td></tr>'
     html += "</table>"
 
     if not scored:
