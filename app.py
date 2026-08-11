@@ -76,6 +76,7 @@ BASE = """
   <a href="/people">Personnel</a>
   <a href="/people/search">Search Personnel</a>
   <a href="/search">Search Documents</a>
+  <a href="/dashboard">Data Quality</a>
 </nav>
 {{ content|safe }}
 </body>
@@ -93,6 +94,98 @@ def _escape(text: str) -> str:
 
 def render(content_html: str) -> str:
     return render_template_string(BASE, content=content_html)
+
+
+@app.route("/dashboard")
+def dashboard():
+    db = get_db()
+    html = "<h1>Data Quality Dashboard</h1>"
+
+    # 1. Proposals with no labor category requirements entered yet
+    proposals = db.execute("SELECT id, name, requirements FROM proposals ORDER BY name").fetchall()
+    missing_req = []
+    for p in proposals:
+        lcats = {}
+        if p["requirements"]:
+            lcats = json.loads(p["requirements"]).get("labor_categories", {})
+        if not lcats:
+            missing_req.append(p)
+
+    html += f"<h2>Proposals missing requirements ({len(missing_req)})</h2>"
+    html += '<p class="snippet">No labor category requirements entered -- matching and export won\'t work for these until requirements are added.</p>'
+    if missing_req:
+        html += "<table><tr><th>Proposal</th></tr>"
+        for p in missing_req:
+            html += f'<tr><td><a class="name" href="/proposal/{p["id"]}">{p["name"]}</a></td></tr>'
+        html += "</table>"
+    else:
+        html += "<p>All proposals have at least one labor category with requirements.</p>"
+
+    # 2. Documents with the highest unclassified/other rate (worst extraction quality)
+    docs = db.execute("""
+        SELECT d.id, d.person_id, d.proposal_id, pe.full_name, p.name as proposal_name,
+               COUNT(*) as total,
+               SUM(CASE WHEN rf.fact_type IN ('unclassified','other') THEN 1 ELSE 0 END) as noisy
+        FROM resume_facts rf
+        JOIN documents d ON rf.source_document_id = d.id
+        LEFT JOIN people pe ON d.person_id = pe.id
+        JOIN proposals p ON d.proposal_id = p.id
+        GROUP BY d.id
+        HAVING total >= 3
+        ORDER BY (noisy * 1.0 / total) DESC, noisy DESC
+        LIMIT 15
+    """).fetchall()
+
+    html += "<h2>Documents with the highest unclassified/other rate</h2>"
+    html += '<p class="snippet">Top 15 documents where extraction is least reliable -- worth reviewing or manually correcting the facts.</p>'
+    if docs:
+        html += "<table><tr><th>Person</th><th>Proposal</th><th>Noisy / Total facts</th><th>%</th></tr>"
+        for d in docs:
+            pct = round(100 * d["noisy"] / d["total"])
+            person_link = (
+                f'<a class="name" href="/person/{d["person_id"]}">{d["full_name"]}</a>'
+                if d["person_id"] else "(unknown)"
+            )
+            html += (
+                f'<tr><td>{person_link}</td>'
+                f'<td><a class="name" href="/proposal/{d["proposal_id"]}">{d["proposal_name"]}</a></td>'
+                f'<td>{d["noisy"]}/{d["total"]}</td><td>{pct}%</td></tr>'
+            )
+        html += "</table>"
+    else:
+        html += "<p>No documents with extracted facts yet.</p>"
+
+    # 3. Personnel with very few extracted facts (possible extraction failure or thin resume)
+    people_counts = db.execute("""
+        SELECT pe.id, pe.full_name, COUNT(rf.id) as fact_count
+        FROM people pe
+        LEFT JOIN documents d ON d.person_id = pe.id AND d.canonical_document_id IS NULL
+        LEFT JOIN resume_facts rf ON rf.source_document_id = d.id
+        GROUP BY pe.id
+        ORDER BY fact_count ASC
+    """).fetchall()
+    low_fact_people = [p for p in people_counts if p["fact_count"] < 3]
+
+    html += f"<h2>Personnel with very few extracted facts &lt;3 ({len(low_fact_people)})</h2>"
+    html += '<p class="snippet">Could mean missing resume content, a failed extraction, or a genuinely thin resume on file -- worth a quick check.</p>'
+    if low_fact_people:
+        html += "<table><tr><th>Person</th><th>Fact count</th></tr>"
+        for p in low_fact_people:
+            html += f'<tr><td><a class="name" href="/person/{p["id"]}">{p["full_name"]}</a></td><td>{p["fact_count"]}</td></tr>'
+        html += "</table>"
+    else:
+        html += "<p>Everyone has at least 3 extracted facts.</p>"
+
+    # Bonus: stale local file cache (e.g. after a folder rename)
+    stale = db.execute("SELECT COUNT(*) as cnt FROM documents WHERE cache_stale = 1").fetchone()
+    if stale["cnt"]:
+        html += (
+            f'<h2>Stale local file cache</h2>'
+            f'<p class="warn">{stale["cnt"]} document(s) point to local files that no longer exist on disk '
+            f'(often from a folder rename). Run <code>ingest.py --cleanup</code> or re-sync and re-ingest.</p>'
+        )
+
+    return render(html)
 
 
 @app.route("/")
