@@ -84,6 +84,7 @@ BASE = """
 
 
 import html as html_lib
+from urllib.parse import quote
 
 
 def _escape(text: str) -> str:
@@ -134,6 +135,69 @@ def update_rfp_metadata(proposal_id):
     return proposal_detail(proposal_id)
 
 
+def _load_requirements(db, proposal_id):
+    row = db.execute("SELECT requirements FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+    data = json.loads(row["requirements"]) if row and row["requirements"] else {}
+    data.setdefault("labor_categories", {})
+    return data
+
+
+def _save_requirements(db, proposal_id, data):
+    db.execute(
+        "UPDATE proposals SET requirements = ?, updated_at = datetime('now') WHERE id = ?",
+        (json.dumps(data, indent=2), proposal_id),
+    )
+    db.commit()
+
+
+def _parse_list(raw: str) -> list:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+@app.route("/proposal/<int:proposal_id>/lcat/add", methods=["POST"])
+def add_lcat(proposal_id):
+    db = get_db()
+    lcat_name = request.form.get("lcat_name", "").strip()
+    if lcat_name:
+        data = _load_requirements(db, proposal_id)
+        data["labor_categories"].setdefault(lcat_name, {
+            "page_limit": None, "required_sections": [], "minimum_years": None,
+            "required_certifications": [], "priority_topics": [],
+        })
+        _save_requirements(db, proposal_id, data)
+    return proposal_detail(proposal_id)
+
+
+@app.route("/proposal/<int:proposal_id>/lcat/<lcat_name>/update", methods=["POST"])
+def update_lcat(proposal_id, lcat_name):
+    db = get_db()
+    data = _load_requirements(db, proposal_id)
+    if lcat_name not in data["labor_categories"]:
+        return proposal_detail(proposal_id)
+
+    page_limit_raw = request.form.get("page_limit", "").strip()
+    years_raw = request.form.get("minimum_years", "").strip()
+
+    data["labor_categories"][lcat_name] = {
+        "page_limit": int(page_limit_raw) if page_limit_raw.isdigit() else None,
+        "required_sections": _parse_list(request.form.get("required_sections", "")),
+        "minimum_years": int(years_raw) if years_raw.isdigit() else None,
+        "required_certifications": _parse_list(request.form.get("required_certifications", "")),
+        "priority_topics": _parse_list(request.form.get("priority_topics", "")),
+    }
+    _save_requirements(db, proposal_id, data)
+    return proposal_detail(proposal_id)
+
+
+@app.route("/proposal/<int:proposal_id>/lcat/<lcat_name>/delete", methods=["POST"])
+def delete_lcat(proposal_id, lcat_name):
+    db = get_db()
+    data = _load_requirements(db, proposal_id)
+    data["labor_categories"].pop(lcat_name, None)
+    _save_requirements(db, proposal_id, data)
+    return proposal_detail(proposal_id)
+
+
 @app.route("/proposal/<int:proposal_id>")
 def proposal_detail(proposal_id):
     db = get_db()
@@ -173,18 +237,33 @@ def proposal_detail(proposal_id):
         if lcats:
             html += "<h2>Labor Category Requirements</h2>"
             for lcat, req in lcats.items():
-                html += f"<h3>{lcat}</h3><table>"
-                html += f'<tr><th>Page limit</th><td>{req.get("page_limit","-")}</td></tr>'
-                html += f'<tr><th>Min years</th><td>{req.get("minimum_years","-")}</td></tr>'
-                html += f'<tr><th>Required sections</th><td>{", ".join(req.get("required_sections") or []) or "-"}</td></tr>'
-                html += f'<tr><th>Required certs</th><td>{", ".join(req.get("required_certifications") or []) or "-"}</td></tr>'
-                html += f'<tr><th>Priority topics</th><td>{", ".join(req.get("priority_topics") or []) or "-"}</td></tr>'
-                html += "</table>"
-                html += f'<a href="/match/{proposal_id}/{lcat}">Find matching personnel for this role &rarr;</a><br><br>'
+                lcat_url = quote(lcat)
+                sections_val = ", ".join(req.get("required_sections") or [])
+                certs_val = ", ".join(req.get("required_certifications") or [])
+                topics_val = ", ".join(req.get("priority_topics") or [])
+                page_limit_val = req.get("page_limit") or ""
+                years_val = req.get("minimum_years") or ""
+
+                html += f"<h3>{lcat}</h3>"
+                html += f'<form method="POST" action="/proposal/{proposal_id}/lcat/{lcat_url}/update"><table>'
+                html += f'<tr><th>Page limit</th><td><input type="text" name="page_limit" value="{page_limit_val}" style="width:100px;"></td></tr>'
+                html += f'<tr><th>Min years</th><td><input type="text" name="minimum_years" value="{years_val}" style="width:100px;"></td></tr>'
+                html += f'<tr><th>Required sections</th><td><input type="text" name="required_sections" value="{_escape(sections_val)}" style="width:100%;" placeholder="comma-separated"></td></tr>'
+                html += f'<tr><th>Required certs</th><td><input type="text" name="required_certifications" value="{_escape(certs_val)}" style="width:100%;" placeholder="comma-separated"></td></tr>'
+                html += f'<tr><th>Priority topics</th><td><input type="text" name="priority_topics" value="{_escape(topics_val)}" style="width:100%;" placeholder="comma-separated"></td></tr>'
+                html += "</table><button type='submit'>Save</button></form>"
+                html += f'<form method="POST" action="/proposal/{proposal_id}/lcat/{lcat_url}/delete" onsubmit="return confirm(\'Remove this labor category?\');" style="display:inline;">'
+                html += '<button type="submit">Remove this labor category</button></form>'
+                html += f'<br><a href="/match/{proposal_id}/{lcat_url}">Find matching personnel for this role &rarr;</a><br><br>'
         else:
-            html += '<p class="warn">No labor category requirements entered yet. Use set_requirements.py to add them.</p>'
+            html += '<p class="warn">No labor category requirements entered yet -- add one below.</p>'
     else:
-        html += '<p class="warn">No requirements entered yet. Use set_requirements.py to add them.</p>'
+        html += '<p class="warn">No labor category requirements entered yet -- add one below.</p>'
+
+    html += '<h3>Add a labor category</h3>'
+    html += f'<form method="POST" action="/proposal/{proposal_id}/lcat/add">'
+    html += '<input type="text" name="lcat_name" placeholder="e.g. Senior Communication Specialist" style="width:320px;"> '
+    html += '<button type="submit">Add</button></form>'
 
     html += "<h2>Documents</h2><table><tr><th>Type</th><th>Person</th><th>File</th></tr>"
     for d in docs:

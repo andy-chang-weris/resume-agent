@@ -174,7 +174,7 @@ KNOWN_CERTS = [
 
 DEGREE_KEYWORDS = [
     "Bachelor of", "Master of", "B.S.", "M.S.", "MBA", "Ph.D.", "PhD",
-    "Bachelor's", "Master's", "Associate of",
+    "Bachelor's", "Master's", "Associate of", "B.A.", "BA ", "BBA", "M.A.",
 ]
 
 DATE_RANGE_RE = re.compile(
