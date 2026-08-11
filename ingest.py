@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS proposals (
     folder_name     TEXT,                    -- most recent raw folder name seen (with deadline)
     status          TEXT DEFAULT 'active',
     requirements    TEXT,
+    rfp_metadata    TEXT,                    -- JSON: auto-extracted TORFP#, contract type,
+                                              -- contracting officer info, etc. -- rule-based,
+                                              -- always review before treating as authoritative
     created_at      TEXT DEFAULT (datetime('now')),
     updated_at      TEXT DEFAULT (datetime('now'))
 );
@@ -109,6 +112,7 @@ CREATE TABLE IF NOT EXISTS resume_facts (
     source_document_id   INTEGER NOT NULL REFERENCES documents(id),
     source_section        TEXT,
     conflict_flag         INTEGER DEFAULT 0,
+    manually_edited       INTEGER DEFAULT 0,
     created_at            TEXT DEFAULT (datetime('now'))
 );
 
@@ -400,6 +404,15 @@ def split_inline_headers(lines: list[str]) -> list[str]:
     result = []
     for line in lines:
         stripped = line.strip()
+        if normalize_header(stripped) is not None:
+            # Already an exact standalone header on its own line (e.g. a
+            # line that IS just "CERTIFICATIONS") -- never attempt to
+            # split these; doing so risks a shorter alias variant (e.g.
+            # singular "certification") matching a prefix of the word and
+            # treating the trailing letters as bogus remainder content.
+            result.append(line)
+            continue
+
         matched = None
         for variant in _ALL_HEADER_VARIANTS_BY_LENGTH:
             vlen = len(variant)
@@ -410,6 +423,14 @@ def split_inline_headers(lines: list[str]) -> list[str]:
                 continue
             if not candidate_prefix.isupper():
                 continue  # only split when styled as a caps header run
+            # Require a genuine word boundary right after the matched
+            # variant (space/colon/dash/end), not just any character --
+            # otherwise "CERTIFICATIONS" (plural) can match the shorter
+            # "certification" (singular) variant and treat the trailing
+            # "S" as if it were separate content.
+            boundary_char = stripped[vlen:vlen + 1]
+            if boundary_char and boundary_char.isalnum():
+                continue
             remainder = stripped[vlen:].lstrip(" :\t-")
             if remainder:
                 matched = (candidate_prefix, remainder)
@@ -548,6 +569,82 @@ def _extract_facts_sentence_fallback(text: str) -> list[dict]:
     return facts
 
 
+SOLICITATION_NUMBER_RE = re.compile(
+    r"(?:Solicitation\s*(?:No\.?|Number|#)?|TORFP\s*#?|RFQ\s*(?:No\.?|Number|#)?|"
+    r"Task\s+Order\s*(?:No\.?|Number|#))\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-]{4,29})",
+    re.IGNORECASE,
+)
+
+CONTRACT_TYPE_PATTERNS = [
+    ("Firm Fixed Price", ["firm fixed price", "ffp"]),
+    ("Time and Materials", ["time and materials", "time-and-materials", "t&m"]),
+    ("Cost Plus Fixed Fee", ["cost plus fixed fee", "cpff"]),
+    ("Cost Reimbursement", ["cost reimbursement", "cost-reimbursement"]),
+    ("Hybrid", ["hybrid contract", "hybrid task order", "hybrid (ffp"]),
+]
+
+CO_NAME_RE = re.compile(
+    r"Contracting\s+Officer\s*(?:\(CO\))?\s*[:\-]?[ \t]*([A-Z][a-zA-Z.'\-]+(?:[ \t]+[A-Z][a-zA-Z.'\-]+){0,3})",
+)
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+
+PHONE_RE = re.compile(r"(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}")
+
+
+def extract_rfp_metadata(text: str) -> dict:
+    """Rule-based extraction of standardized RFP metadata fields. These
+    fields (solicitation number, contract type, CO contact info) tend to
+    follow much more consistent boilerplate patterns across federal
+    solicitations than free-form content like 'labor category' or
+    'priority topics' did -- but this is still regex/keyword matching,
+    not language understanding. Fields that aren't confidently found are
+    left null rather than guessed. Always spot-check against the real
+    document; treat this as a fast first pass, not a verified result.
+    """
+    result = {
+        "solicitation_number": None,
+        "contract_type": None,
+        "contracting_officer_name": None,
+        "contracting_officer_email": None,
+        "contracting_officer_phone": None,
+        "_extraction_method": "rule_based_v1",
+        "_needs_review": True,
+    }
+
+    sol_match = SOLICITATION_NUMBER_RE.search(text)
+    if sol_match:
+        result["solicitation_number"] = sol_match.group(1).strip()
+
+    text_lower = text.lower()
+    for label, keywords in CONTRACT_TYPE_PATTERNS:
+        if any(kw in text_lower for kw in keywords):
+            result["contract_type"] = label
+            break
+
+    co_match = CO_NAME_RE.search(text)
+    if co_match:
+        result["contracting_officer_name"] = co_match.group(1).strip().split("\n")[0].strip()
+
+    # Look for an email/phone near the words "Contracting Officer" first
+    # (more likely to actually belong to the CO, not some other contact
+    # elsewhere in the document); fall back to the first one found anywhere.
+    co_context = ""
+    co_idx = text.lower().find("contracting officer")
+    if co_idx != -1:
+        co_context = text[co_idx:co_idx + 400]
+
+    email_match = EMAIL_RE.search(co_context) or EMAIL_RE.search(text)
+    if email_match:
+        result["contracting_officer_email"] = email_match.group(0)
+
+    phone_match = PHONE_RE.search(co_context) or PHONE_RE.search(text)
+    if phone_match:
+        result["contracting_officer_phone"] = phone_match.group(0)
+
+    return result
+
+
 def get_or_create(cur: sqlite3.Cursor, table: str, key_col: str, key_val: str) -> int:
     cur.execute(f"SELECT id FROM {table} WHERE {key_col} = ?", (key_val,))
     row = cur.fetchone()
@@ -578,6 +675,26 @@ def get_or_create_proposal(cur: sqlite3.Cursor, raw_folder_name: str) -> int:
     return cur.lastrowid
 
 
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add columns to existing databases that predate this version of the
+    schema, without touching any existing data. Safe to run every time."""
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(resume_facts)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if "manually_edited" not in existing_cols:
+        cur.execute("ALTER TABLE resume_facts ADD COLUMN manually_edited INTEGER DEFAULT 0")
+        conn.commit()
+
+    cur.execute("PRAGMA table_info(proposals)")
+    existing_cols = {row[1] for row in cur.fetchall()}
+    if "rfp_metadata" not in existing_cols:
+        cur.execute("ALTER TABLE proposals ADD COLUMN rfp_metadata TEXT")
+        conn.commit()
+    if "rfp_metadata_manually_edited" not in existing_cols:
+        cur.execute("ALTER TABLE proposals ADD COLUMN rfp_metadata_manually_edited INTEGER DEFAULT 0")
+        conn.commit()
+
+
 def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = False) -> None:
     manifest = {}
     if manifest_path and manifest_path.exists():
@@ -588,6 +705,7 @@ def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = 
     cur = conn.cursor()
     cur.executescript(SCHEMA)
     conn.commit()
+    migrate_schema(conn)
 
     records = classify_and_collect(root)
     if not records:
@@ -626,7 +744,10 @@ def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = 
                 (proposal_id, person_id, rec.doc_type, sharepoint_url,
                  rec.path.suffix.lower(), stat.st_size, stat.st_mtime, text, doc_id),
             )
-            cur.execute("DELETE FROM resume_facts WHERE source_document_id = ?", (doc_id,))
+            cur.execute(
+                "DELETE FROM resume_facts WHERE source_document_id = ? AND manually_edited = 0",
+                (doc_id,),
+            )
             updated += 1
         else:
             cur.execute(
@@ -651,6 +772,16 @@ def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = 
                      fact["start_date"], fact["end_date"], doc_id, fact.get("source_section")),
                 )
                 facts_created += 1
+
+        if rec.doc_type == "rfp" and text.strip():
+            cur.execute("SELECT rfp_metadata_manually_edited FROM proposals WHERE id = ?", (proposal_id,))
+            already_edited = (cur.fetchone() or [0])[0]
+            if not already_edited:
+                metadata = extract_rfp_metadata(text)
+                cur.execute(
+                    "UPDATE proposals SET rfp_metadata = ?, updated_at = datetime('now') WHERE id = ?",
+                    (json.dumps(metadata, indent=2), proposal_id),
+                )
 
     conn.commit()
     conn.close()

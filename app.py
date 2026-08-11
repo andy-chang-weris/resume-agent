@@ -115,6 +115,25 @@ def proposals():
     return render(html)
 
 
+@app.route("/proposal/<int:proposal_id>/metadata/update", methods=["POST"])
+def update_rfp_metadata(proposal_id):
+    db = get_db()
+    fields = [
+        "solicitation_number", "contract_type", "contracting_officer_name",
+        "contracting_officer_email", "contracting_officer_phone",
+    ]
+    metadata = {f: (request.form.get(f, "").strip() or None) for f in fields}
+    metadata["_extraction_method"] = "manual"
+    metadata["_needs_review"] = False
+
+    db.execute(
+        "UPDATE proposals SET rfp_metadata = ?, rfp_metadata_manually_edited = 1, updated_at = datetime('now') WHERE id = ?",
+        (json.dumps(metadata, indent=2), proposal_id),
+    )
+    db.commit()
+    return proposal_detail(proposal_id)
+
+
 @app.route("/proposal/<int:proposal_id>")
 def proposal_detail(proposal_id):
     db = get_db()
@@ -129,6 +148,24 @@ def proposal_detail(proposal_id):
 
     html = f'<h1>{p["name"]}</h1>'
     html += f'<p class="snippet">Folder: {p["folder_name"] or "(unknown)"}</p>'
+
+    meta = json.loads(p["rfp_metadata"]) if p["rfp_metadata"] else {}
+    meta_fields = [
+        ("solicitation_number", "Solicitation / TORFP #"),
+        ("contract_type", "Contract Type"),
+        ("contracting_officer_name", "Contracting Officer"),
+        ("contracting_officer_email", "CO Email"),
+        ("contracting_officer_phone", "CO Phone"),
+    ]
+
+    html += '<h2>RFP Details</h2>'
+    if meta.get("_needs_review", True) and meta.get("_extraction_method") != "manual":
+        html += '<p class="warn">Auto-extracted from the RFP text (rule-based, not guaranteed accurate) -- review and correct below if needed.</p>'
+    html += '<form method="POST" action="/proposal/' + str(proposal_id) + '/metadata/update"><table>'
+    for field_key, label in meta_fields:
+        value = meta.get(field_key) or ""
+        html += f'<tr><th>{label}</th><td><input type="text" name="{field_key}" value="{_escape(value)}" style="width:100%;"></td></tr>'
+    html += '</table><button type="submit">Save RFP Details</button></form>'
 
     if p["requirements"]:
         data = json.loads(p["requirements"])
@@ -172,6 +209,36 @@ def people():
     return render(html)
 
 
+FACT_TYPES = ["summary", "education", "certification", "employment", "skills", "years_of_experience", "other"]
+
+
+@app.route("/fact/<int:fact_id>/update", methods=["POST"])
+def update_fact(fact_id):
+    db = get_db()
+    fact_type = request.form.get("fact_type", "").strip()
+    fact_text = request.form.get("fact_text", "").strip()
+    person_id = request.form.get("person_id")
+
+    if fact_type not in FACT_TYPES or not fact_text:
+        return render('<p class="warn">Invalid update -- fact_type or fact_text was empty/invalid.</p>')
+
+    db.execute(
+        "UPDATE resume_facts SET fact_type = ?, fact_text = ?, manually_edited = 1 WHERE id = ?",
+        (fact_type, fact_text, fact_id),
+    )
+    db.commit()
+    return person_detail(int(person_id))
+
+
+@app.route("/fact/<int:fact_id>/delete", methods=["POST"])
+def delete_fact(fact_id):
+    db = get_db()
+    person_id = request.form.get("person_id")
+    db.execute("DELETE FROM resume_facts WHERE id = ?", (fact_id,))
+    db.commit()
+    return person_detail(int(person_id))
+
+
 @app.route("/person/<int:person_id>")
 def person_detail(person_id):
     db = get_db()
@@ -189,10 +256,9 @@ def person_detail(person_id):
 
     for d in docs:
         facts = db.execute(
-            "SELECT fact_type, fact_text, start_date, end_date, conflict_flag FROM resume_facts WHERE source_document_id = ? ORDER BY fact_type",
+            "SELECT * FROM resume_facts WHERE source_document_id = ? ORDER BY fact_type",
             (d["id"],),
         ).fetchall()
-        facts_json = json.dumps([dict(f) for f in facts], indent=2)
         raw_text = d["raw_text"] or "(no text extracted)"
 
         html += f'<h3>{d["proposal_name"]} &mdash; {d["doc_type"]}</h3>'
@@ -202,9 +268,29 @@ def person_detail(person_id):
         html += f'<pre style="white-space: pre-wrap; background:#f7f7f7; padding:10px; border-radius:4px; max-height:400px; overflow:auto;">{_escape(raw_text)}</pre>'
         html += '</details>'
 
-        html += f'<details><summary>Resume facts ({len(facts)}) &mdash; raw JSON</summary>'
-        html += f'<pre style="white-space: pre-wrap; background:#f7f7f7; padding:10px; border-radius:4px; max-height:400px; overflow:auto;">{_escape(facts_json)}</pre>'
-        html += '</details><br>'
+        html += f'<details open><summary>Resume facts ({len(facts)}) &mdash; click to edit</summary>'
+        html += '<table><tr><th>Type</th><th>Text</th><th>Edited?</th><th></th></tr>'
+        for f in facts:
+            options_html = "".join(
+                f'<option value="{ft}"{" selected" if ft == f["fact_type"] else ""}>{ft}</option>'
+                for ft in FACT_TYPES
+            )
+            edited_badge = '<span class="tag">edited</span>' if f["manually_edited"] else ""
+            html += (
+                f'<tr>'
+                f'<td><form method="POST" action="/fact/{f["id"]}/update" style="display:flex; gap:4px; align-items:flex-start;">'
+                f'<input type="hidden" name="person_id" value="{person_id}">'
+                f'<select name="fact_type">{options_html}</select>'
+                f'</td>'
+                f'<td><textarea name="fact_text" rows="2" style="width:100%; font-size:0.88em;">{_escape(f["fact_text"])}</textarea></td>'
+                f'<td>{edited_badge}</td>'
+                f'<td><button type="submit">Save</button></form>'
+                f'<form method="POST" action="/fact/{f["id"]}/delete" style="display:inline;" onsubmit="return confirm(\'Delete this fact?\');">'
+                f'<input type="hidden" name="person_id" value="{person_id}">'
+                f'<button type="submit">Delete</button></form></td>'
+                f'</tr>'
+            )
+        html += "</table></details><br>"
 
     return render(html)
 
