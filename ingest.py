@@ -378,7 +378,21 @@ def classify_and_collect(root: Path) -> list[FileRecord]:
         for folder_name, doc_type in DOC_TYPE_BY_FOLDER.items():
             subfolder = proposal_folder / folder_name
             for f in _walk_files(subfolder):
-                person_name = guess_person_name(f.name) if doc_type != "rfp" else None
+                if doc_type == "rfp":
+                    records.append(FileRecord(f, proposal_name, doc_type, None))
+                    continue
+                # Resumes sometimes sit directly in the Historical/Generated
+                # Resumes folder (name comes from the filename), but more
+                # often each person has their own subfolder containing
+                # possibly-generic filenames like "Resume.docx" -- in that
+                # case the real name is the subfolder, not the file. Check
+                # both: if the file is nested inside a subfolder here, use
+                # that subfolder's name; otherwise fall back to the filename.
+                rel_parts = f.relative_to(subfolder).parts
+                if len(rel_parts) > 1:
+                    person_name = guess_person_name(rel_parts[0])
+                else:
+                    person_name = guess_person_name(f.name)
                 records.append(FileRecord(f, proposal_name, doc_type, person_name))
 
         for f in proposal_folder.iterdir():
