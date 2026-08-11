@@ -168,6 +168,97 @@ DATE_RANGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Maps section header text (many possible real-world variants, since
+# different RFPs ask for different header wording) to one canonical
+# fact_type. Add new variants here as you encounter them -- this list
+# will never cover every possible header, so anything that doesn't
+# match falls back to being captured under its own literal header name
+# (fact_type='other', source_section=<the header as written>) rather
+# than being silently dropped or shredded into unclassified sentences.
+HEADER_ALIASES: dict[str, list[str]] = {
+    "summary": ["summary", "professional summary", "executive summary", "profile", "overview"],
+    "education": ["education", "education & training", "academic background"],
+    "certification": ["certifications", "certification", "credentials", "licenses & certifications"],
+    "employment": [
+        "employment", "employment history", "work history", "professional experience",
+        "experience", "relevant experience", "recent experience", "recent work experience",
+        "relevant work experience", "project experience", "project history",
+        "relevant project experience",
+    ],
+    "skills": [
+        "skills", "technical skills", "core competencies", "key skills", "technologies",
+        "core qualifications", "areas of expertise", "qualifications alignment",
+        "senior project management qualifications",
+    ],
+    "years_of_experience": ["years of experience", "total years of experience"],
+    "clearance": ["clearance", "security clearance"],
+    "training": ["training", "training & development"],
+}
+
+# Build a reverse lookup: normalized header text -> canonical fact_type.
+_HEADER_LOOKUP: dict[str, str] = {}
+for canonical, variants in HEADER_ALIASES.items():
+    for variant in variants:
+        _HEADER_LOOKUP[variant.lower().strip()] = canonical
+
+HEADER_LINE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 &/\-']{1,45}$")
+BULLET_PREFIX_RE = re.compile(r"^[\u2022\u25cf\-\*\u2013]\s*")
+
+
+def normalize_header(line: str) -> str | None:
+    """Return the canonical fact_type for a header line, if recognized."""
+    key = line.lower().strip().rstrip(":")
+    return _HEADER_LOOKUP.get(key)
+
+
+def looks_like_header(line: str, next_line: str | None = None) -> bool:
+    """Heuristic: short line, no sentence-ending punctuation, not a bullet,
+    consistent with a resume section header.
+
+    Detection has two tiers:
+    1. If the line's normalized text exactly matches a known alias in
+       HEADER_ALIASES (e.g. 'Certifications', 'certifications', or
+       'CERTIFICATIONS'), it's trusted as a header unconditionally --
+       casing and what follows it don't matter, since we already know
+       this exact wording is a real header from prior data.
+    2. Otherwise, fall back to structural guessing for headers we haven't
+       seen before: ALL CAPS lines are trusted directly; Title Case lines
+       are only treated as headers if the next line is a bullet, since
+       otherwise short Title Case sentences/job titles (e.g. 'Task Leader')
+       get misdetected.
+    """
+    stripped = line.strip().rstrip(":")
+    if not stripped or len(stripped) > 46:
+        return False
+    if BULLET_PREFIX_RE.match(line.strip()):
+        return False
+    if stripped.endswith((".", ",")):
+        return False
+    if not HEADER_LINE_RE.match(stripped):
+        return False
+
+    if normalize_header(stripped) is not None:
+        return True
+
+    if stripped.isupper():
+        # Single-word ALL CAPS lines under 6 chars are very likely
+        # acronym content (PMP, SQL, AWS, CPA, ITIL, CISA) rather than a
+        # genuine section header -- real unknown headers we haven't seen
+        # before tend to be longer or multi-word (AWARDS, TRAINING,
+        # EXPERTISE). This only affects the fallback guess for headers
+        # NOT already in HEADER_ALIASES; known short headers like
+        # 'SKILLS' are still caught by the exact-alias check above.
+        if " " not in stripped and len(stripped) < 6:
+            return False
+        return True
+
+    if next_line is not None and BULLET_PREFIX_RE.match(next_line.strip()):
+        words = stripped.split()
+        capitalized = sum(1 for w in words if w[:1].isupper())
+        return capitalized >= max(1, len(words) - 1)
+
+    return False
+
 # Strips a trailing "(...)" from a proposal folder name, e.g.
 # "BTS TO31 Program Support (Aug 18 3pm)" -> "BTS TO31 Program Support"
 # This is what most of your folder names use to hold the current deadline,
@@ -189,6 +280,26 @@ class FileRecord:
     person_name: str | None
 
 
+def _iter_docx_blocks(document):
+    """Yield paragraphs and tables in the actual order they appear in the
+    document body. python-docx's .paragraphs and .tables properties each
+    return their own type in isolation, with no positional relationship to
+    each other -- appending all paragraphs then all tables (the previous
+    approach here) silently misattributes table content to whatever header
+    happened to be last in the paragraph stream, which is wrong whenever a
+    resume's layout uses tables for structure (very common)."""
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    body = document.element.body
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, document)
+        elif child.tag == qn("w:tbl"):
+            yield Table(child, document)
+
+
 def extract_text(path: Path) -> str:
     ext = path.suffix.lower()
     try:
@@ -203,7 +314,18 @@ def extract_text(path: Path) -> str:
             if docx_lib is None:
                 return ""
             document = docx_lib.Document(str(path))
-            return "\n".join(p.text for p in document.paragraphs)
+            parts = []
+            for block in _iter_docx_blocks(document):
+                if hasattr(block, "text"):  # Paragraph
+                    if block.text.strip():
+                        parts.append(block.text)
+                else:  # Table -- walk cells in reading order (row by row)
+                    for row in block.rows:
+                        for cell in row.cells:
+                            cell_text = cell.text.strip()
+                            if cell_text:
+                                parts.append(cell_text)
+            return "\n".join(parts)
     except Exception as exc:
         print(f"  [warn] could not extract text from {path}: {exc}", file=sys.stderr)
     return ""
@@ -220,8 +342,18 @@ def _walk_files(folder: Path):
     if not folder.exists():
         return
     for f in sorted(folder.rglob("*")):
-        if f.is_file() and f.suffix.lower() in SUPPORTED_TEXT_EXT:
-            yield f
+        if not f.is_file() or f.suffix.lower() not in SUPPORTED_TEXT_EXT:
+            continue
+        if f.name.startswith("~$"):
+            # Word/Office temporary lock file, created while the real file
+            # is open for editing (e.g. "~$Cedric Schulman.docx" alongside
+            # "Cedric Schulman.docx"). Not real content -- always skip.
+            continue
+        if f.name.startswith("."):
+            # Hidden/system files (e.g. macOS .DS_Store companions,
+            # sync-client conflict markers) -- also not real content.
+            continue
+        yield f
 
 
 def classify_and_collect(root: Path) -> list[FileRecord]:
@@ -242,12 +374,144 @@ def classify_and_collect(root: Path) -> list[FileRecord]:
     return records
 
 
-def extract_facts(text: str) -> list[dict]:
-    """Very simple rule-based fact extraction. Meant to be reviewed, not
-    trusted as-is. Splits text into lines/sentences and tags a subset
-    using keyword and regex matching; everything else is stored as
-    'unclassified' so no source content is silently dropped.
+_ALL_HEADER_VARIANTS_BY_LENGTH = sorted(
+    {v for variants in HEADER_ALIASES.values() for v in variants},
+    key=len, reverse=True,
+)
+
+
+def split_inline_headers(lines: list[str]) -> list[str]:
+    """Some resume templates style a section header as a bolded run at the
+    START of a paragraph, immediately followed by body text with no line
+    break (e.g. one single paragraph reading 'CORE QUALIFICATIONS Ms. Doe
+    exceeds the requirements for...'). Plain-text extraction can't see the
+    bold formatting that visually separates them, so the header and body
+    text arrive as one unbroken line and never get detected as a header at
+    all -- the whole block then gets misattributed to whichever real
+    header came before it.
+
+    This splits such lines into a proper header line + remainder, but only
+    when the matched prefix is ALL CAPS in the original text (not just
+    case-insensitively similar), to avoid false-splitting ordinary
+    sentences that happen to start with a header word in regular sentence
+    case (e.g. 'Experience managing federal contracts...' should NOT be
+    split just because 'experience' is a known alias).
     """
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        matched = None
+        for variant in _ALL_HEADER_VARIANTS_BY_LENGTH:
+            vlen = len(variant)
+            if len(stripped) <= vlen:
+                continue
+            candidate_prefix = stripped[:vlen]
+            if candidate_prefix.lower() != variant.lower():
+                continue
+            if not candidate_prefix.isupper():
+                continue  # only split when styled as a caps header run
+            remainder = stripped[vlen:].lstrip(" :\t-")
+            if remainder:
+                matched = (candidate_prefix, remainder)
+                break
+        if matched:
+            result.append(matched[0])
+            result.append(matched[1])
+        else:
+            result.append(line)
+    return result
+
+
+def extract_facts(text: str) -> list[dict]:
+    """Structural, header-aware fact extraction.
+
+    Splits the document into sections by detecting header lines, maps each
+    header to a canonical fact_type via HEADER_ALIASES (so 'Relevant
+    Experience' and 'Recent Experience' land in the same bucket regardless
+    of which wording a given RFP's resume format used), and treats each
+    bullet/line under a header as one fact.
+
+    Headers that don't match any known alias are NOT dropped -- they're
+    captured with fact_type='other' and source_section set to the literal
+    header text, so nothing silently disappears and you can see which new
+    header variants show up in real resumes and add them to HEADER_ALIASES.
+
+    If no headers are detected at all (pure narrative resume with no
+    structure), falls back to the old sentence-based heuristic extraction
+    so something is still captured rather than nothing.
+    """
+    lines = [ln.rstrip() for ln in text.split("\n")]
+    lines = [ln for ln in lines if ln.strip()]
+    lines = split_inline_headers(lines)
+
+    sections: list[tuple[str, str | None, list[str]]] = []  # (header_text, fact_type_or_None, body_lines)
+    current_header = None
+    current_fact_type = None
+    current_body: list[str] = []
+    any_header_found = False
+
+    for i, line in enumerate(lines):
+        next_line = lines[i + 1] if i + 1 < len(lines) else None
+        if looks_like_header(line, next_line):
+            if current_header is not None:
+                sections.append((current_header, current_fact_type, current_body))
+            current_header = line.strip().rstrip(":")
+            current_fact_type = normalize_header(current_header)
+            current_body = []
+            any_header_found = True
+        else:
+            current_body.append(line)
+
+    if current_header is not None:
+        sections.append((current_header, current_fact_type, current_body))
+    elif current_body:
+        # no headers ever found -- treat everything as one unheadered block
+        sections.append((None, None, current_body))
+
+    if not any_header_found:
+        return _extract_facts_sentence_fallback(text)
+
+    facts: list[dict] = []
+
+    for header_text, fact_type, body_lines in sections:
+        if header_text is None:
+            # content before the first header (or no headers at all) --
+            # run the sentence fallback just on this chunk
+            facts.extend(_extract_facts_sentence_fallback("\n".join(body_lines)))
+            continue
+
+        resolved_type = fact_type or "other"
+        source_section = header_text if fact_type is None else None
+
+        if resolved_type == "summary":
+            # Summary is prose, not bullets -- keep as one block
+            block_text = " ".join(body_lines).strip()
+            if block_text:
+                facts.append({
+                    "fact_type": "summary", "fact_text": block_text,
+                    "start_date": None, "end_date": None, "source_section": source_section,
+                })
+            continue
+
+        for line in body_lines:
+            clean_line = BULLET_PREFIX_RE.sub("", line).strip()
+            if not clean_line:
+                continue
+            date_match = DATE_RANGE_RE.search(clean_line)
+            facts.append({
+                "fact_type": resolved_type,
+                "fact_text": clean_line,
+                "start_date": date_match.group(1) if date_match else None,
+                "end_date": date_match.group(2) if date_match else None,
+                "source_section": source_section,
+            })
+
+    return facts
+
+
+def _extract_facts_sentence_fallback(text: str) -> list[dict]:
+    """Original sentence-splitting heuristic, used only when no section
+    headers are detected at all (pure narrative resume)."""
     facts: list[dict] = []
     lines = [ln.strip() for ln in re.split(r"[\n.]", text) if ln.strip()]
 
@@ -257,7 +521,7 @@ def extract_facts(text: str) -> list[dict]:
         for cert in KNOWN_CERTS:
             if cert.lower() in line.lower():
                 facts.append({"fact_type": "certification", "fact_text": line,
-                               "start_date": None, "end_date": None})
+                               "start_date": None, "end_date": None, "source_section": None})
                 matched = True
                 break
         if matched:
@@ -265,22 +529,21 @@ def extract_facts(text: str) -> list[dict]:
 
         if any(kw.lower() in line.lower() for kw in DEGREE_KEYWORDS):
             facts.append({"fact_type": "education", "fact_text": line,
-                           "start_date": None, "end_date": None})
+                           "start_date": None, "end_date": None, "source_section": None})
             continue
 
         date_match = DATE_RANGE_RE.search(line)
         if date_match and len(line) > 15:
             facts.append({
-                "fact_type": "employment",
-                "fact_text": line,
-                "start_date": date_match.group(1),
-                "end_date": date_match.group(2),
+                "fact_type": "employment", "fact_text": line,
+                "start_date": date_match.group(1), "end_date": date_match.group(2),
+                "source_section": None,
             })
             continue
 
         if len(line) > 40:
             facts.append({"fact_type": "unclassified", "fact_text": line,
-                           "start_date": None, "end_date": None})
+                           "start_date": None, "end_date": None, "source_section": None})
 
     return facts
 
@@ -315,7 +578,7 @@ def get_or_create_proposal(cur: sqlite3.Cursor, raw_folder_name: str) -> int:
     return cur.lastrowid
 
 
-def ingest(root: Path, db_path: Path, manifest_path: Path | None) -> None:
+def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = False) -> None:
     manifest = {}
     if manifest_path and manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -343,7 +606,7 @@ def ingest(root: Path, db_path: Path, manifest_path: Path | None) -> None:
         )
         existing = cur.fetchone()
 
-        if existing and existing[1] == stat.st_size and abs(existing[2] - stat.st_mtime) < 1:
+        if existing and not force and existing[1] == stat.st_size and abs(existing[2] - stat.st_mtime) < 1:
             skipped += 1
             continue
 
@@ -385,7 +648,7 @@ def ingest(root: Path, db_path: Path, manifest_path: Path | None) -> None:
                         source_document_id, source_section)
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (person_id, fact["fact_type"], fact["fact_text"],
-                     fact["start_date"], fact["end_date"], doc_id, None),
+                     fact["start_date"], fact["end_date"], doc_id, fact.get("source_section")),
                 )
                 facts_created += 1
 
@@ -430,6 +693,11 @@ def main():
         help="After ingesting, mark any documents whose local_cache_path no longer "
              "exists (e.g. due to a folder rename) as cache_stale=1",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Re-process every file and re-extract facts even if the file hasn't "
+             "changed since the last ingest. Use this after updating extraction logic.",
+    )
     args = parser.parse_args()
 
     if not args.root.exists() or not args.root.is_dir():
@@ -441,7 +709,7 @@ def main():
     if docx_lib is None:
         print("[warn] python-docx not installed; DOCX text will not be extracted.", file=sys.stderr)
 
-    ingest(args.root, args.db, args.manifest)
+    ingest(args.root, args.db, args.manifest, args.force)
 
     if args.cleanup:
         conn = sqlite3.connect(args.db)

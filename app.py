@@ -74,12 +74,20 @@ BASE = """
 <nav>
   <a href="/">Proposals</a>
   <a href="/people">Personnel</a>
-  <a href="/search">Search</a>
+  <a href="/people/search">Search Personnel</a>
+  <a href="/search">Search Documents</a>
 </nav>
 {{ content|safe }}
 </body>
 </html>
 """
+
+
+import html as html_lib
+
+
+def _escape(text: str) -> str:
+    return html_lib.escape(text)
 
 
 def render(content_html: str) -> str:
@@ -177,10 +185,27 @@ def person_detail(person_id):
         WHERE d.person_id = ? ORDER BY p.name, d.doc_type
     """, (person_id,)).fetchall()
 
-    html = f'<h1>{person["full_name"]}</h1><h2>Resumes on file</h2><table><tr><th>Proposal</th><th>Type</th><th>File</th></tr>'
+    html = f'<h1>{person["full_name"]}</h1><h2>Resumes on file</h2>'
+
     for d in docs:
-        html += f'<tr><td><a class="name" href="/proposal/{d["proposal_id"]}">{d["proposal_name"]}</a></td><td>{d["doc_type"]}</td><td class="snippet">{Path(d["local_cache_path"]).name}</td></tr>'
-    html += "</table>"
+        facts = db.execute(
+            "SELECT fact_type, fact_text, start_date, end_date, conflict_flag FROM resume_facts WHERE source_document_id = ? ORDER BY fact_type",
+            (d["id"],),
+        ).fetchall()
+        facts_json = json.dumps([dict(f) for f in facts], indent=2)
+        raw_text = d["raw_text"] or "(no text extracted)"
+
+        html += f'<h3>{d["proposal_name"]} &mdash; {d["doc_type"]}</h3>'
+        html += f'<p class="snippet">File: {Path(d["local_cache_path"]).name}</p>'
+
+        html += '<details><summary>Raw extracted text</summary>'
+        html += f'<pre style="white-space: pre-wrap; background:#f7f7f7; padding:10px; border-radius:4px; max-height:400px; overflow:auto;">{_escape(raw_text)}</pre>'
+        html += '</details>'
+
+        html += f'<details><summary>Resume facts ({len(facts)}) &mdash; raw JSON</summary>'
+        html += f'<pre style="white-space: pre-wrap; background:#f7f7f7; padding:10px; border-radius:4px; max-height:400px; overflow:auto;">{_escape(facts_json)}</pre>'
+        html += '</details><br>'
+
     return render(html)
 
 
@@ -210,6 +235,49 @@ def search():
         for r in rows:
             html += f'<tr><td>{r["full_name"] or "-"}</td><td><a class="name" href="/proposal/{r["proposal_id"]}">{r["proposal_name"]}</a></td><td>{r["doc_type"]}</td><td class="snippet">{r["snip"]}</td></tr>'
         html += "</table>"
+
+    return render(html)
+
+
+@app.route("/people/search")
+def people_search():
+    q = request.args.get("q", "").strip()
+    html = "<h1>Search Personnel by Skills/Keywords</h1>"
+    html += "<p class=\"snippet\">Search directly across all historical resumes without needing a stored proposal/LCAT first.</p>"
+    html += "<form><input type=text name=q value='" + q.replace("'", "") + "' placeholder='e.g. PMP, AWS, stakeholder engagement'> <button>Search</button></form>"
+
+    if q:
+        keywords = [kw.strip() for kw in q.split(",") if kw.strip()]
+        html += f'<p class="snippet">Matching against: {", ".join(keywords)}</p>'
+
+        db = get_db()
+        people_rows = db.execute("SELECT id, full_name FROM people ORDER BY full_name").fetchall()
+
+        scored = []
+        for person in people_rows:
+            docs = db.execute(
+                "SELECT raw_text FROM documents WHERE person_id = ? AND doc_type = 'resume_historical'",
+                (person["id"],),
+            ).fetchall()
+            combined_text = " ".join((d["raw_text"] or "") for d in docs).lower()
+            if not combined_text:
+                continue
+            matched_kw = [kw for kw in keywords if kw.lower() in combined_text]
+            if matched_kw:
+                scored.append((person, matched_kw))
+
+        scored.sort(key=lambda x: len(x[1]), reverse=True)
+
+        html += '<p class="warn">Keyword-overlap match against historical resume text, not a judgment of fit. Review the actual resume before deciding someone qualifies.</p>'
+        html += "<table><tr><th>Person</th><th>Score</th><th>Matched keywords</th></tr>"
+        for person, matched_kw in scored:
+            html += f'<tr><td><a class="name" href="/person/{person["id"]}">{person["full_name"]}</a></td>'
+            html += f'<td class="score">{len(matched_kw)}/{len(keywords)}</td>'
+            html += f'<td>{", ".join(matched_kw)}</td></tr>'
+        html += "</table>"
+
+        if not scored:
+            html += "<p>No personnel matched any of the given keywords.</p>"
 
     return render(html)
 

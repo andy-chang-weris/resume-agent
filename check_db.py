@@ -43,4 +43,12 @@ cur.execute("SELECT fact_text FROM resume_facts WHERE fact_type = 'unclassified'
 for row in cur.fetchall():
     print(" ", row[0])
 
+print("\n=== Header text breakdown (fact_type='other', grouped by source_section) ===")
+cur.execute("""
+    SELECT source_section, COUNT(*) FROM resume_facts
+    WHERE fact_type = 'other' GROUP BY source_section ORDER BY COUNT(*) DESC
+""")
+for row in cur.fetchall():
+    print(" ", row)
+
 conn.close()
