@@ -83,7 +83,6 @@ def enter_requirements(conn: sqlite3.Connection, proposal_name: str, lcat: str) 
     proposal_id, existing_json = row
     data = json.loads(existing_json) if existing_json else {}
     data.setdefault("labor_categories", {})
-    data.setdefault("priority_topics", [])
 
     existing_lcat = data["labor_categories"].get(lcat, {})
 
@@ -96,11 +95,9 @@ def enter_requirements(conn: sqlite3.Connection, proposal_name: str, lcat: str) 
         "required_sections": prompt_list("required sections", existing_lcat.get("required_sections")),
         "minimum_years": prompt_value("Minimum years of experience", existing_lcat.get("minimum_years"), int),
         "required_certifications": prompt_list("required certifications", existing_lcat.get("required_certifications")),
+        "priority_topics": prompt_list("priority topics (this role's emphasis, e.g. skills/themes to highlight)", existing_lcat.get("priority_topics")),
     }
     data["labor_categories"][lcat] = lcat_requirements
-
-    print(f"\n  (Priority topics apply to the whole proposal, not just this labor category)")
-    data["priority_topics"] = prompt_list("priority topics", data.get("priority_topics"))
 
     data["_extraction_method"] = "manual"
     data["_needs_review"] = False
