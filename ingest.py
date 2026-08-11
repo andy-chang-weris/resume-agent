@@ -190,20 +190,20 @@ DATE_RANGE_RE = re.compile(
 # (fact_type='other', source_section=<the header as written>) rather
 # than being silently dropped or shredded into unclassified sentences.
 HEADER_ALIASES: dict[str, list[str]] = {
-    "summary": ["summary", "professional summary", "executive summary", "profile", "overview"],
     "education": ["education", "education & training", "academic background"],
     "certification": ["certifications", "certification", "credentials", "licenses & certifications"],
     "employment": [
         "employment", "employment history", "work history", "professional experience",
         "experience", "relevant experience", "recent experience", "recent work experience",
         "relevant work experience", "project experience", "project history",
-        "relevant project experience",
+        "relevant project experience", "work experience",
     ],
     "skills": [
         "skills", "technical skills", "core competencies", "key skills", "technologies",
         "core qualifications", "areas of expertise", "qualifications alignment",
-        "senior project management qualifications",
+        "senior project management qualifications", "qualifications summary",
     ],
+    "summary": ["summary", "professional summary", "executive summary", "profile", "overview", "professional profile"],
     "years_of_experience": ["years of experience", "total years of experience"],
     "clearance": ["clearance", "security clearance"],
     "training": ["training", "training & development"],
@@ -235,11 +235,16 @@ def looks_like_header(line: str, next_line: str | None = None) -> bool:
        'CERTIFICATIONS'), it's trusted as a header unconditionally --
        casing and what follows it don't matter, since we already know
        this exact wording is a real header from prior data.
-    2. Otherwise, fall back to structural guessing for headers we haven't
-       seen before: ALL CAPS lines are trusted directly; Title Case lines
-       are only treated as headers if the next line is a bullet, since
-       otherwise short Title Case sentences/job titles (e.g. 'Task Leader')
-       get misdetected.
+    2. Otherwise, ALL CAPS lines are trusted as an unknown-header guess
+       (bucketed as 'other' for later review).
+
+    A weaker third tier (Title Case line immediately followed by a
+    bullet) was removed after real data showed it misfiring on job
+    titles and dates that precede a bullet list (e.g. 'Senior Business
+    Analyst/Team Lead', 'September 2018') -- those are sub-labels within
+    a section, not new sections, and are safer left as body content
+    under whatever section they're actually in than promoted to a new,
+    wrong 'other' section.
     """
     stripped = line.strip().rstrip(":")
     if not stripped or len(stripped) > 46:
@@ -265,11 +270,6 @@ def looks_like_header(line: str, next_line: str | None = None) -> bool:
         if " " not in stripped and len(stripped) < 6:
             return False
         return True
-
-    if next_line is not None and BULLET_PREFIX_RE.match(next_line.strip()):
-        words = stripped.split()
-        capitalized = sum(1 for w in words if w[:1].isupper())
-        return capitalized >= max(1, len(words) - 1)
 
     return False
 
@@ -467,7 +467,7 @@ def split_inline_headers(lines: list[str]) -> list[str]:
     return result
 
 
-def extract_facts(text: str) -> list[dict]:
+def extract_facts(text: str, person_name: str | None = None) -> list[dict]:
     """Structural, header-aware fact extraction.
 
     Splits the document into sections by detecting header lines, maps each
@@ -488,6 +488,20 @@ def extract_facts(text: str) -> list[dict]:
     lines = [ln.rstrip() for ln in text.split("\n")]
     lines = [ln for ln in lines if ln.strip()]
     lines = split_inline_headers(lines)
+
+    if person_name:
+        # Resume templates often print the candidate's own name as a
+        # standalone banner line (frequently ALL CAPS), which otherwise
+        # gets misdetected as an unknown section header since it's
+        # structurally indistinguishable from a real one (e.g.
+        # 'LISA MORENO' looks just like 'CORE QUALIFICATIONS'). We
+        # already know the person's name for this document, so drop any
+        # line that's just their name before header detection runs.
+        normalized_name = re.sub(r"[^a-z0-9]", "", person_name.lower())
+        lines = [
+            ln for ln in lines
+            if re.sub(r"[^a-z0-9]", "", ln.strip().lower()) != normalized_name
+        ]
 
     sections: list[tuple[str, str | None, list[str]]] = []  # (header_text, fact_type_or_None, body_lines)
     current_header = None
@@ -821,7 +835,7 @@ def ingest(root: Path, db_path: Path, manifest_path: Path | None, force: bool = 
             inserted += 1
 
         if rec.doc_type in ("resume_historical", "resume_generated") and person_id and canonical_document_id is None:
-            for fact in extract_facts(text):
+            for fact in extract_facts(text, person_name=rec.person_name):
                 cur.execute(
                     """INSERT INTO resume_facts
                        (person_id, fact_type, fact_text, start_date, end_date,
